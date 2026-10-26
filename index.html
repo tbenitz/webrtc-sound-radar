@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WebRTC Sound Radar</title>
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<style>
+  :root { --bg: #0a0e17; --panel: #121826; --accent: #00ff9f; --text: #e0e0e0; --warn: #ff6b6b; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font-family: system-ui, sans-serif; display: flex; flex-direction: column; align-items: center; min-height: 100vh; }
+  h1 { margin: 12px 0; font-size: 1.4rem; color: var(--accent); }
+  .panel { background: var(--panel); border-radius: 12px; padding: 16px; margin: 8px; width: min(960px, 96vw); }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin: 8px 0; }
+  input, button, select { background: #1a2233; color: var(--text); border: 1px solid #2a3548; border-radius: 6px; padding: 8px 12px; font-size: 0.95rem; }
+  button { cursor: pointer; background: #1e2a3e; }
+  button:hover { background: #26344d; }
+  button.primary { background: var(--accent); color: #000; font-weight: 600; }
+  button.primary:hover { filter: brightness(1.1); }
+  #status { font-size: 0.9rem; color: #aaa; }
+  #peerId { font-family: monospace; font-size: 1.1rem; color: var(--accent); }
+  canvas { background: #05080f; border-radius: 8px; width: 100%; max-width: 600px; height: auto; display: block; margin: 12px auto; }
+  .meters { display: flex; gap: 20px; justify-content: center; }
+  .meter { width: 120px; }
+  .bar { height: 12px; background: #222; border-radius: 6px; overflow: hidden; }
+  .fill { height: 100%; background: var(--accent); width: 0%; transition: width 0.05s; }
+  .info { font-size: 0.85rem; color: #aaa; line-height: 1.4; }
+  .warn { color: var(--warn); }
+</style>
+</head>
+<body>
+<h1>WebRTC Sound Radar</h1>
+<div class="panel">
+  <div class="row">
+    <button id="hostBtn" class="primary">Host Session</button>
+    <button id="joinBtn">Join Session</button>
+    <span id="status">Ready</span>
+  </div>
+  <div class="row" id="hostRow" style="display:none">
+    <strong>Your Peer ID:</strong> <span id="peerId"></span>
+    <button id="copyBtn">Copy</button>
+  </div>
+  <div class="row" id="joinRow" style="display:none">
+    <input id="remoteId" placeholder="Enter Host Peer ID" style="flex:1">
+    <button id="connectBtn" class="primary">Connect</button>
+  </div>
+  <div class="row">
+    <label>Baseline distance (m): <input id="baseline" type="number" value="1.5" min="0.3" max="10" step="0.1" style="width:80px"></label>
+    <button id="pingBtn">Send Calibration Ping</button>
+    <button id="clearBtn">Clear Radar</button>
+  </div>
+  <div class="meters">
+    <div class="meter">Local<br><div class="bar"><div class="fill" id="localBar"></div></div><span id="localVol">0</span> dB</div>
+    <div class="meter">Remote<br><div class="bar"><div class="fill" id="remoteBar"></div></div><span id="remoteVol">0</span> dB</div>
+  </div>
+  <canvas id="radar" width="600" height="500"></canvas>
+  <div class="info" id="info">
+    Open on two devices with microphones. Host creates a session and shares the Peer ID. Join connects.<br>
+    Place devices a known distance apart (set baseline). Make sounds; the radar estimates source position via time-difference of arrival (TDOA).<br>
+    Use calibration ping for better clock sync. Accuracy depends on quiet room, similar mic gains, and low network latency.<br>
+    <span class="warn">Note: Browser mics have processing (AGC, noise suppression) that can affect timing. Disable if possible for better results.</span>
+  </div>
+</div>
+
+<script>
+const SPEED_OF_SOUND = 343; // m/s
+let peer, conn, localStream, audioCtx, analyserLocal, analyserRemote;
+let localBuffer = [], remoteBuffer = [];
+let sampleRate = 44100;
+let clockOffset = 0; // estimated remote - local time offset
+let isHost = false;
+let lastPingTime = 0;
+const canvas = document.getElementById('radar');
+const ctx = canvas.getContext('2d');
+const blips = []; // {x, y, life, strength}
+
+function log(msg) { document.getElementById('status').textContent = msg; console.log(msg); }
+
+function initPeer(asHost) {
+  isHost = asHost;
+  peer = new Peer();
+  peer.on('open', id => {
+    document.getElementById('peerId').textContent = id;
+    document.getElementById('hostRow').style.display = asHost ? 'flex' : 'none';
+    document.getElementById('joinRow').style.display = asHost ? 'none' : 'flex';
+    log(asHost ? 'Hosting. Share Peer ID.' : 'Ready to join.');
+  });
+  peer.on('error', err => log('Peer error: ' + err));
+  peer.on('connection', c => {
+    if (conn) conn.close();
+    conn = c;
+    setupConnection();
+  });
+  peer.on('call', call => {
+    // optional media, but we use data for control
+  });
+}
+
+document.getElementById('hostBtn').onclick = () => initPeer(true);
+document.getElementById('joinBtn').onclick = () => initPeer(false);
+document.getElementById('connectBtn').onclick = () => {
+  const id = document.getElementById('remoteId').value.trim();
+  if (!id || !peer) return;
+  conn = peer.connect(id);
+  setupConnection();
+};
+document.getElementById('copyBtn').onclick = () => {
+  navigator.clipboard.writeText(document.getElementById('peerId').textContent);
+  log('Copied');
+};
+
+function setupConnection() {
+  conn.on('open', () => {
+    log('Connected to peer');
+    startAudio();
+  });
+  conn.on('data', data => handleData(data));
+  conn.on('close', () => log('Connection closed'));
+}
+
+async function startAudio() {
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, sampleRate: 44100 }
+    });
+    audioCtx = new AudioContext({ sampleRate: 44100 });
+    sampleRate = audioCtx.sampleRate;
+    const source = audioCtx.createMediaStreamSource(localStream);
+    analyserLocal = audioCtx.createAnalyser();
+    analyserLocal.fftSize = 2048;
+    source.connect(analyserLocal);
+    // Use ScriptProcessor for chunk capture (demo only)
+    const processor = audioCtx.createScriptProcessor(2048, 1, 1);
+    source.connect(processor);
+    processor.connect(audioCtx.destination); // silent
+    processor.onaudioprocess = e => {
+      const input = e.inputBuffer.getChannelData(0);
+      const chunk = new Float32Array(input);
+      localBuffer.push({ data: chunk, time: performance.now() });
+      if (localBuffer.length > 20) localBuffer.shift();
+      // Send every few chunks to reduce bandwidth
+      if (Math.random() < 0.3 && conn && conn.open) {
+        const buf = chunk.buffer.slice(0);
+        conn.send({ type: 'audio', buffer: buf, time: performance.now(), sr: sampleRate });
+      }
+      updateVolume('local');
+    };
+    log('Microphone active');
+  } catch (err) {
+    log('Mic error: ' + err.message);
+  }
+}
+
+function handleData(data) {
+  if (data.type === 'audio') {
+    const arr = new Float32Array(data.buffer);
+    remoteBuffer.push({ data: arr, time: data.time + clockOffset });
+    if (remoteBuffer.length > 20) remoteBuffer.shift();
+    processLocalization();
+    updateVolume('remote', arr);
+  } else if (data.type === 'ping') {
+    // detect beep roughly by energy spike
+    lastPingTime = performance.now();
+    // simple response
+    if (conn && conn.open) conn.send({ type: 'pong', recvTime: performance.now() });
+  } else if (data.type === 'pong') {
+    const rtt = performance.now() - lastPingTime;
+    clockOffset = (data.recvTime - lastPingTime) - rtt / 2; // rough
+    log(`Calibration RTT ~${rtt.toFixed(0)}ms, offset ${clockOffset.toFixed(1)}ms`);
+  }
+}
+
+function processLocalization() {
+  if (localBuffer.length < 2 || remoteBuffer.length < 2) return;
+  // Take recent overlapping windows
+  const local = localBuffer[localBuffer.length - 1].data;
+  const remote = remoteBuffer[remoteBuffer.length - 1].data;
+  const result = crossCorrelate(local, remote);
+  if (result.correlation > 0.15) { // threshold
+    const lagSamples = result.lag;
+    const delay = lagSamples / sampleRate;
+    const distDiff = delay * SPEED_OF_SOUND;
+    const baseline = parseFloat(document.getElementById('baseline').value) || 1.5;
+    // Approximate position: assume far-field or simple model
+    // Place mics at y=400, x=150 and x=450
+    const midX = 300;
+    const scale = 80; // pixels per meter
+    // Simple: x offset proportional to distDiff
+    let estX = midX + (distDiff / baseline) * 100;
+    estX = Math.max(50, Math.min(550, estX));
+    const vol = Math.max(rms(local), rms(remote));
+    const estY = 400 - Math.min(300, vol * 800);
+    addBlip(estX, estY, vol);
+    document.getElementById('info').innerHTML = `
+      Delay: ${(delay*1000).toFixed(1)} ms | Dist diff: ${distDiff.toFixed(2)} m | Corr: ${result.correlation.toFixed(2)}<br>
+      Baseline: ${baseline} m. Blips show estimated source locations (brighter = louder).`;
+  }
+}
+
+function crossCorrelate(a, b) {
+  const n = Math.min(a.length, b.length, 1024);
+  let max = -Infinity, best = 0;
+  const maxLag = 200; // ~4.5ms at 44kHz ~1.5m
+  for (let lag = -maxLag; lag <= maxLag; lag += 2) { // step 2 for speed
+    let sum = 0, cnt = 0;
+    for (let i = 0; i < n; i++) {
+      const j = i + lag;
+      if (j >= 0 && j < n) {
+        sum += a[i] * b[j];
+        cnt++;
+      }
+    }
+    const c = cnt ? sum / cnt : 0;
+    if (c > max) { max = c; best = lag; }
+  }
+  return { lag: best, correlation: max };
+}
+
+function rms(arr) {
+  let s = 0;
+  for (let i = 0; i < arr.length; i += 4) s += arr[i] * arr[i];
+  return Math.sqrt(s / (arr.length / 4));
+}
+
+function updateVolume(which, arr) {
+  const data = arr || (which === 'local' ? getAnalyserData(analyserLocal) : null);
+  if (!data) return;
+  const r = rms(data);
+  const db = 20 * Math.log10(r + 1e-6);
+  const pct = Math.max(0, Math.min(100, (db + 60) * 1.5));
+  document.getElementById(which + 'Bar').style.width = pct + '%';
+  document.getElementById(which + 'Vol').textContent = db.toFixed(0);
+}
+
+function getAnalyserData(an) {
+  if (!an) return null;
+  const arr = new Float32Array(an.fftSize);
+  an.getFloatTimeDomainData(arr);
+  return arr;
+}
+
+function addBlip(x, y, strength) {
+  blips.push({ x, y, life: 1, strength });
+  if (blips.length > 40) blips.shift();
+}
+
+function drawRadar() {
+  const w = canvas.width, h = canvas.height;
+  ctx.fillStyle = '#05080f';
+  ctx.fillRect(0, 0, w, h);
+  // Grid
+  ctx.strokeStyle = '#1a2a1a';
+  ctx.lineWidth = 1;
+  for (let r = 50; r < 250; r += 50) {
+    ctx.beginPath();
+    ctx.arc(300, 420, r, 0, Math.PI, true);
+    ctx.stroke();
+  }
+  // Mics
+  const baseline = parseFloat(document.getElementById('baseline').value) || 1.5;
+  const sep = Math.min(200, baseline * 60);
+  const mx1 = 300 - sep / 2, mx2 = 300 + sep / 2, my = 420;
+  ctx.fillStyle = '#00ff9f';
+  ctx.beginPath(); ctx.arc(mx1, my, 8, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(mx2, my, 8, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#aaa';
+  ctx.font = '12px sans-serif';
+  ctx.fillText('Mic 1', mx1 - 20, my + 20);
+  ctx.fillText('Mic 2', mx2 - 20, my + 20);
+  // Blips
+  for (let i = blips.length - 1; i >= 0; i--) {
+    const b = blips[i];
+    b.life -= 0.015;
+    if (b.life <= 0) { blips.splice(i, 1); continue; }
+    ctx.globalAlpha = b.life * Math.min(1, b.strength * 3);
+    ctx.fillStyle = `hsl(${120 - b.strength * 100}, 100%, 50%)`;
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, 6 + b.strength * 8, 0, Math.PI*2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  requestAnimationFrame(drawRadar);
+}
+drawRadar();
+
+document.getElementById('pingBtn').onclick = () => {
+  if (!audioCtx || !conn) return;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.frequency.value = 1000;
+  gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.15);
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + 0.15);
+  lastPingTime = performance.now();
+  if (conn.open) conn.send({ type: 'ping', time: lastPingTime });
+  log('Ping sent');
+};
+
+document.getElementById('clearBtn').onclick = () => { blips.length = 0; };
+</script>
+</body>
+</html>
